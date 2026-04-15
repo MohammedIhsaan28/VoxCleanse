@@ -11,7 +11,7 @@ import shutil
 from threading import Lock
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import numpy as np
 import soundfile as sf
@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from denoise_file_df2 import DF2Denoiser, denoise_file, _resample_if_needed
+from scoring import compute_scores
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -31,6 +32,7 @@ SAMPLE_RATE = 16000
 CHUNK_SIZE = 1600
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_HISTORY_PATH = OUTPUT_DIR / "session_history.json"
 
 DEEPFILTER_MODEL_BASE_DIR = str(Path(__file__).resolve().parent / "models")
 DEEPFILTER_DEVICE = "auto"
@@ -43,6 +45,8 @@ SUMMARIZER_MODEL = "sshleifer/distilbart-cnn-12-6"
 SUMMARIZER_MIN_WORDS = 40
 SUMMARIZER_MAX_CHUNK_TOKENS = 900
 
+history_lock = Lock()
+
 
 class SummarizeRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -53,7 +57,6 @@ class TextSummarizer:
         logger.info("Loading summarizer model %s on %s...", model_name, device)
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 
-        self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
         pipeline_device = 0 if device != "cpu" else -1
@@ -128,8 +131,12 @@ class SessionManager:
             "audio_chunks": [],
             "cleaned_audio_chunks": [],
             "sample_rate": SAMPLE_RATE,
+            "total_cleaned_samples": 0,
             "original_transcript": [],
             "refined_transcript": [],
+            "analysis_windows": 0,
+            "silent_windows": 0,
+            "score_history": [],
             "custom_filters": {},
             "is_active": True,
         }
@@ -141,6 +148,60 @@ class SessionManager:
     def close(self, session_id: str) -> None:
         if session_id in self.sessions:
             self.sessions[session_id]["is_active"] = False
+
+
+def _load_session_history() -> List[Dict]:
+    if not SESSION_HISTORY_PATH.exists():
+        return []
+    try:
+        payload = json.loads(SESSION_HISTORY_PATH.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return payload
+        return []
+    except Exception:
+        return []
+
+
+def _save_session_history(entries: List[Dict]) -> None:
+    SESSION_HISTORY_PATH.write_text(json.dumps(entries, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _persist_session_result(
+    session_id: str,
+    mode: str,
+    original_text: str,
+    refined_text: str,
+    scores: Dict,
+    score_history: List[Dict],
+) -> None:
+    record = {
+        "session_id": session_id,
+        "mode": mode,
+        "created_at": datetime.now().isoformat(),
+        "scores": {
+            "fluency": scores.get("fluency", 0.0),
+            "vocabulary": scores.get("vocabulary", 0.0),
+            "communication": scores.get("communication", 0.0),
+            "overall": scores.get("overall", 0.0),
+            "communication_level": scores.get("communication_level", "A1"),
+        },
+        "metrics": scores.get("metrics", {}),
+        "feedback": scores.get("feedback", []),
+        "overall_feedback": scores.get("overall_feedback", ""),
+        "detailed_feedback": scores.get("detailed_feedback", {}),
+        "original_preview": (original_text or "")[:280],
+        "refined_preview": (refined_text or "")[:280],
+        "overall_history": [float(p.get("overall", 0.0)) for p in (score_history or [])],
+        "history_points": len(score_history or []),
+    }
+
+    with history_lock:
+        history = _load_session_history()
+        history.append(record)
+        # Keep newest 500 records to avoid unbounded growth.
+        if len(history) > 500:
+            history = history[-500:]
+        _save_session_history(history)
 
 
 def _normalize_custom_filters(filters: Optional[Dict[str, Optional[str]]]) -> Dict[str, Optional[str]]:
@@ -196,6 +257,33 @@ def _parse_custom_filters(raw_filters: Optional[str]) -> Dict[str, Optional[str]
         raise HTTPException(status_code=400, detail="custom_filters must be a JSON object")
 
     return _normalize_custom_filters(parsed)
+
+
+class TextProcessor:
+    def __init__(self):
+        self.custom_filters: Dict[str, Optional[str]] = {}
+
+    def set_custom_filters(self, filters: Dict[str, Optional[str]]) -> None:
+        self.custom_filters = filters or {}
+
+    def process(self, text: str) -> str:
+        if not text:
+            return ""
+
+        result = text
+        for word, replacement in self.custom_filters.items():
+            if not word:
+                continue
+            if replacement is None:
+                replacement = ""
+            result = result.replace(word, replacement)
+            result = result.replace(word.lower(), replacement)
+            result = result.replace(word.upper(), replacement)
+
+        result = " ".join(result.split())
+        if result:
+            result = result[0].upper() + result[1:]
+        return result
 
 
 class Transcriber:
@@ -268,6 +356,7 @@ session_manager = SessionManager()
 shared_denoiser: Optional[DF2Denoiser] = None
 shared_transcriber: Optional[Transcriber] = None
 streaming_transcriber: Optional[StreamingTranscriber] = None
+text_processor = TextProcessor()
 shared_summarizer: Optional[TextSummarizer] = None
 summarizer_lock = Lock()
 
@@ -281,11 +370,72 @@ def _get_shared_summarizer() -> TextSummarizer:
     return shared_summarizer
 
 
-def _save_transcript_file(session_id: str, original: str, refined: str) -> Path:
+def _append_score_history(session: Dict, score_payload: Dict, timestamp: str) -> Dict:
+    history = session.setdefault("score_history", [])
+    point = {
+        "step": len(history) + 1,
+        "timestamp": timestamp,
+        "fluency": score_payload.get("fluency", 0.0),
+        "vocabulary": score_payload.get("vocabulary", 0.0),
+        "communication": score_payload.get("communication", 0.0),
+        "overall": score_payload.get("overall", 0.0),
+    }
+    history.append(point)
+    return point
+
+
+def _save_transcript_file(session_id: str, original: str, refined: str, scores: Optional[Dict] = None) -> Path:
     path = OUTPUT_DIR / f"refined_transcript_{session_id}.txt"
+    score_block = ""
+    if scores:
+        detailed = scores.get("detailed_feedback", {}) if isinstance(scores.get("detailed_feedback", {}), dict) else {}
+        pace_feedback = detailed.get("pace_feedback", []) or []
+        vocabulary_feedback = detailed.get("vocabulary_feedback", []) or []
+        grammar_feedback = detailed.get("grammar_feedback", []) or []
+        rewrite_examples = detailed.get("rewrite_examples", []) or []
+        filler_highlights = detailed.get("filler_highlights", []) or []
+        highlighted_transcript = detailed.get("highlighted_transcript", "") or ""
+        improvement_tips = detailed.get("improvement_tips", []) or []
+        overall_feedback = scores.get("overall_feedback", "")
+
+        score_block = (
+            "COMMUNICATION SCORES\n"
+            + "-" * 60
+            + "\n"
+            + f"Fluency Score: {scores.get('fluency', 0):.2f}/100\n"
+            + f"Vocabulary Score: {scores.get('vocabulary', 0):.2f}/100\n"
+            + f"Communication Score: {scores.get('communication', 0):.2f}/100\n"
+            + f"Overall Score: {scores.get('overall', 0):.2f}/100\n\n"
+            + f"Communication Level: {scores.get('communication_level', 'A1')} - {scores.get('communication_level_label', '')}\n"
+            + f"Level Description: {scores.get('communication_level_description', '')}\n\n"
+            + f"Overall Feedback: {overall_feedback}\n\n"
+            + "Detailed Feedback\n"
+            + "-" * 60
+            + "\n"
+            + "Pace Feedback\n"
+            + "\n".join(f"- {item}" for item in pace_feedback)
+            + "\n\nVocabulary Feedback\n"
+            + "\n".join(f"- {item}" for item in vocabulary_feedback)
+            + "\n\nGrammar Feedback\n"
+            + "\n".join(f"- {item}" for item in grammar_feedback)
+            + "\n\nInstead Of Saying X, Say Y\n"
+            + "\n".join(f"- {item.get('from', '')} -> {item.get('to', '')}" for item in rewrite_examples)
+            + "\n\nFiller Highlights\n"
+            + "\n".join(f"- {item.get('word', '')} ({item.get('count', 0)}x)" for item in filler_highlights)
+            + "\n\nHighlighted Transcript\n"
+            + highlighted_transcript
+            + "\n\nImprovement Tips\n"
+            + "\n".join(f"- {item}" for item in improvement_tips)
+            + "\n\n"
+            + "Insights:\n"
+            + "\n".join(f"- {item}" for item in scores.get("feedback", []))
+            + "\n\n"
+        )
     content = (
         "SPEECH ENHANCEMENT TRANSCRIPT\n"
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        + score_block
+        +
         "ORIGINAL TRANSCRIPT\n"
         "-" * 60
         + "\n"
@@ -355,6 +505,28 @@ async def summarize_transcript(payload: SummarizeRequest):
     }
 
 
+@app.get("/sessions/history")
+async def sessions_history(limit: int = 50):
+    limit = max(1, min(int(limit), 200))
+    with history_lock:
+        history = _load_session_history()
+    history = sorted(history, key=lambda x: x.get("created_at", ""), reverse=True)
+    return {
+        "count": len(history),
+        "items": history[:limit],
+    }
+
+
+@app.get("/sessions/history/{session_id}")
+async def session_history_item(session_id: str):
+    with history_lock:
+        history = _load_session_history()
+    match = next((item for item in history if item.get("session_id") == session_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Session history not found")
+    return match
+
+
 @app.websocket("/ws/audio")
 async def ws_audio(websocket: WebSocket):
     await websocket.accept()
@@ -374,6 +546,7 @@ async def ws_audio(websocket: WebSocket):
             if m_type == "config":
                 filters = _normalize_custom_filters(message.get("custom_filters", {}))
                 session["custom_filters"] = filters
+                text_processor.set_custom_filters(filters)
                 refined_transcript = _rebuild_refined_transcript(session)
                 await websocket.send_json(
                     {
@@ -397,14 +570,33 @@ async def ws_audio(websocket: WebSocket):
                 cleaned_audio = shared_denoiser.denoise_chunk(audio_data, sample_rate)
                 session["audio_chunks"].append(audio_data.tolist())
                 session["cleaned_audio_chunks"].append(cleaned_audio.tolist())
+                session["total_cleaned_samples"] = int(session.get("total_cleaned_samples", 0)) + int(len(cleaned_audio))
 
                 text = streaming_transcriber.add_chunk(cleaned_audio)
+                if text is not None:
+                    session["analysis_windows"] = int(session.get("analysis_windows", 0)) + 1
                 original_text = (text or "").strip()
                 refined_text = ""
                 if original_text:
                     refined_text = _apply_custom_filters(original_text, session.get("custom_filters", {}))
                     session["original_transcript"].append(original_text)
                     session["refined_transcript"].append(refined_text)
+                elif text is not None:
+                    session["silent_windows"] = int(session.get("silent_windows", 0)) + 1
+
+                rolling_score = None
+                rolling_history_point = None
+                if text is not None:
+                    running_original = " ".join(session.get("original_transcript", []))
+                    running_refined = " ".join(session.get("refined_transcript", []))
+                    running_duration = float(session.get("total_cleaned_samples", 0)) / float(SAMPLE_RATE)
+                    rolling_score = compute_scores(
+                        text=running_original,
+                        cleaned_text=running_refined,
+                        duration_sec=running_duration,
+                        pause_count=int(session.get("silent_windows", 0)),
+                    )
+                    rolling_history_point = _append_score_history(session, rolling_score, datetime.now().isoformat())
 
                 await websocket.send_json(
                     {
@@ -413,9 +605,21 @@ async def ws_audio(websocket: WebSocket):
                         "cleaned_audio": cleaned_audio.tolist(),
                         "original_text": original_text,
                         "refined_text": refined_text,
+                        "rolling_scores": rolling_score,
+                        "score_history_point": rolling_history_point,
                         "timestamp": datetime.now().isoformat(),
                     }
                 )
+
+                if rolling_score is not None:
+                    await websocket.send_json(
+                        {
+                            "type": "score_update",
+                            "session_id": session_id,
+                            "scores": rolling_score,
+                            "history_point": rolling_history_point,
+                        }
+                    )
                 continue
 
             if m_type == "end_session":
@@ -427,6 +631,8 @@ async def ws_audio(websocket: WebSocket):
                     session["refined_transcript"].append(
                         _apply_custom_filters(final_text, session.get("custom_filters", {}))
                     )
+                elif streaming_transcriber is not None:
+                    session["silent_windows"] = int(session.get("silent_windows", 0)) + 1
 
                 cleaned_chunks = session.get("cleaned_audio_chunks", [])
                 cleaned_audio = (
@@ -441,7 +647,6 @@ async def ws_audio(websocket: WebSocket):
                     else np.array([], dtype=np.float32)
                 )
                 stream_sample_rate = int(session.get("sample_rate", SAMPLE_RATE))
-
                 cleaned_audio_path = OUTPUT_DIR / f"cleaned_audio_{session_id}.wav"
                 original_audio_path = OUTPUT_DIR / f"original_audio_{session_id}.wav"
                 sf.write(str(cleaned_audio_path), cleaned_audio, stream_sample_rate)
@@ -449,12 +654,32 @@ async def ws_audio(websocket: WebSocket):
 
                 original = " ".join(session.get("original_transcript", []))
                 refined = " ".join(session.get("refined_transcript", []))
-                _save_transcript_file(session_id, original, refined)
+                duration_sec = float(len(cleaned_audio) / SAMPLE_RATE) if cleaned_audio.size else 0.0
+                score_payload = compute_scores(
+                    text=original,
+                    cleaned_text=refined,
+                    duration_sec=duration_sec,
+                    pause_count=int(session.get("silent_windows", 0)),
+                )
+                final_point = _append_score_history(session, score_payload, datetime.now().isoformat())
+
+                _save_transcript_file(session_id, original, refined, score_payload)
+                _persist_session_result(
+                    session_id=session_id,
+                    mode="live",
+                    original_text=original,
+                    refined_text=refined,
+                    scores=score_payload,
+                    score_history=session.get("score_history", []),
+                )
 
                 await websocket.send_json(
                     {
                         "type": "session_ended",
                         "session_id": session_id,
+                        "scores": score_payload,
+                        "score_history": session.get("score_history", []),
+                        "final_history_point": final_point,
                         "download_urls": {
                             "audio": f"/download/audio/{session_id}",
                             "original_audio": f"/download/audio/original/{session_id}",
@@ -519,12 +744,40 @@ async def upload_audio_file(file: UploadFile = File(...), custom_filters: str = 
         original_text = shared_transcriber.transcribe(cleaned_audio, cleaned_sr)
         refined_text = _apply_custom_filters(original_text, filters)
 
-        _save_transcript_file(session_id, original_text, refined_text)
+        duration_sec = float(len(cleaned_audio) / cleaned_sr) if cleaned_sr > 0 else 0.0
+        score_payload = compute_scores(
+            text=original_text,
+            cleaned_text=refined_text,
+            duration_sec=duration_sec,
+            pause_count=0,
+        )
+        score_history = [
+            {
+                "step": 1,
+                "timestamp": datetime.now().isoformat(),
+                "fluency": score_payload.get("fluency", 0.0),
+                "vocabulary": score_payload.get("vocabulary", 0.0),
+                "communication": score_payload.get("communication", 0.0),
+                "overall": score_payload.get("overall", 0.0),
+            }
+        ]
+
+        _save_transcript_file(session_id, original_text, refined_text, score_payload)
+        _persist_session_result(
+            session_id=session_id,
+            mode="upload",
+            original_text=original_text,
+            refined_text=refined_text,
+            scores=score_payload,
+            score_history=score_history,
+        )
 
         return {
             "session_id": session_id,
             "original_transcript": original_text,
             "refined_transcript": refined_text,
+            "scores": score_payload,
+            "score_history": score_history,
             "download_urls": {
                 "audio": f"/download/audio/{session_id}",
                 "original_audio": f"/download/audio/original/{session_id}",

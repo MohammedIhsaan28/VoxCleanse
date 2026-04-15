@@ -10,11 +10,11 @@ function SummaryPanel({
   disabled,
 }) {
   return (
-    <div className="summary-panel card">
+    <div className="summary-panel card-lite">
       <div className="summary-head">
         <div>
           <h3>Transcript Summary</h3>
-          <p>Generate a short version of the refined transcript for quick understanding.</p>
+          <p>Generate a concise version of the refined transcript for quick review.</p>
         </div>
         <button className="btn accent summary-btn" onClick={onSummarize} disabled={disabled || isSummarizing}>
           {isSummarizing ? 'Summarizing...' : 'Summarize Transcript'}

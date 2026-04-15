@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -159,6 +160,45 @@ streaming_transcriber: Optional[StreamingTranscriber] = None
 text_processor = TextProcessor()
 
 
+class PassthroughDenoiser:
+    """Fallback denoiser used when DeepFilterNet weights are unavailable."""
+
+    def denoise_chunk(self, audio_chunk: np.ndarray, sample_rate: int) -> np.ndarray:
+        return np.asarray(audio_chunk, dtype=np.float32)
+
+    def denoise_audio(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        return np.asarray(audio, dtype=np.float32)
+
+
+def _build_denoiser() -> object:
+    try:
+        return DF2Denoiser(
+            model_dir=DEEPFILTER_MODEL_BASE_DIR,
+            device=DEEPFILTER_DEVICE,
+            epoch=DEEPFILTER_EPOCH,
+        )
+    except FileNotFoundError as exc:
+        logger.warning("DeepFilterNet model not found, falling back to passthrough denoiser: %s", exc)
+    except Exception as exc:
+        logger.warning("DeepFilterNet failed to initialize, falling back to passthrough denoiser: %s", exc)
+
+    return PassthroughDenoiser()
+
+
+def _denoise_uploaded_file(input_path: Path, output_path: Path) -> None:
+    if isinstance(shared_denoiser, DF2Denoiser):
+        denoise_file(
+            input_path=input_path,
+            output_path=output_path,
+            model_dir=DEEPFILTER_MODEL_BASE_DIR,
+            device=DEEPFILTER_DEVICE,
+            epoch=DEEPFILTER_EPOCH,
+        )
+        return
+
+    shutil.copy2(input_path, output_path)
+
+
 def _save_transcript_file(session_id: str, original: str, refined: str) -> Path:
     path = OUTPUT_DIR / f"refined_transcript_{session_id}.txt"
     content = (
@@ -183,11 +223,7 @@ def _save_transcript_file(session_id: str, original: str, refined: str) -> Path:
 async def startup_event():
     global shared_denoiser, shared_transcriber, streaming_transcriber
     logger.info("Initializing speech enhancement system...")
-    shared_denoiser = DF2Denoiser(
-        model_dir=DEEPFILTER_MODEL_BASE_DIR,
-        device=DEEPFILTER_DEVICE,
-        epoch=DEEPFILTER_EPOCH,
-    )
+    shared_denoiser = _build_denoiser()
     shared_transcriber = Transcriber(model_size=WHISPER_MODEL, device=WHISPER_DEVICE)
     streaming_transcriber = StreamingTranscriber(shared_transcriber, sample_rate=SAMPLE_RATE)
     logger.info("System initialized successfully")
@@ -329,13 +365,7 @@ async def upload_audio_file(file: UploadFile = File(...)):
         with open(temp_path, "wb") as fh:
             fh.write(await file.read())
 
-        denoise_file(
-            input_path=temp_path,
-            output_path=cleaned_audio_path,
-            model_dir=DEEPFILTER_MODEL_BASE_DIR,
-            device=DEEPFILTER_DEVICE,
-            epoch=DEEPFILTER_EPOCH,
-        )
+        _denoise_uploaded_file(temp_path, cleaned_audio_path)
 
         cleaned_audio, cleaned_sr = sf.read(str(cleaned_audio_path), dtype="float32")
         if cleaned_audio.ndim > 1:

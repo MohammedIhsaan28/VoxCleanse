@@ -19,6 +19,7 @@ torchaudio==2.4.1
 faster-whisper==1.0.3
 deepfilterlib==0.5.6
 deepfilternet==0.5.6
+transformers==4.48.3
 
 # Utils
 pydantic==2.9.2
